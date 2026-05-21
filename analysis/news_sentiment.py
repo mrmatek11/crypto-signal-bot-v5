@@ -25,12 +25,15 @@ Użycie:
 import os
 import time
 import json
-import requests
+import logging
+import requests as _requests
 import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import OrderedDict
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -270,32 +273,43 @@ class NewsFetcher:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SentimentAnalyzer:
-    """Analizuje sentiment newsów przez LLM."""
+    """
+    Analizuje sentiment newsów przez GLM API bezpośrednio.
     
-    def __init__(self):
-        self._zai = None
+    FIX: usunięto Node.js subprocess — nie istnieje w Docker image.
+    Teraz używa bezpośrednio requests do GLM API (ten sam endpoint
+    co glm_analyst.py — zero nowych zależności).
     
-    async def _get_zai(self):
-        """Lazy init z-ai-web-dev-sdk."""
-        if self._zai is None:
-            from z_ai_web_dev_sdk import ZAI
-            self._zai = await ZAI.create()
-        return self._zai
+    Jeśli GLM_API_KEY nie jest ustawiony, używa rule-based fallback.
+    """
+    
+    GLM_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    
+    def __init__(self, api_key: str = ""):
+        self._api_key = api_key or os.getenv("GLM_API_KEY", "")
+        self._masked_key = f"{self._api_key[:8]}..." if len(self._api_key) > 8 else "(not set)"
+        
+        if not self._api_key:
+            logger.info("[SentimentAnalyzer] No GLM API key — using rule-based fallback")
     
     def analyze_sync(self, news_items: List[NewsItem], symbol: str) -> SentimentScore:
         """
-        Analizuj sentiment newsów synchronicznie.
-        Używa subprocess żeby wywołać Node.js SDK.
+        Analizuj sentiment newsów.
+        
+        FIX: używa requests do GLM API zamiast Node.js subprocess.
+        Fallback do rule-based jeśli brak klucza lub API error.
         """
         if not news_items:
             return SentimentScore(
-                score=0.0,
-                confidence=0.0,
+                score=0.0, confidence=0.0,
                 summary="Brak newsów do analizy",
                 news_count=0,
                 timestamp=datetime.now(timezone.utc),
                 symbol=symbol,
             )
+        
+        if not self._api_key:
+            return self._rule_based_fallback(news_items, symbol)
         
         # Przygotuj tekst newsów
         news_text = ""
@@ -305,100 +319,90 @@ class SentimentAnalyzer:
                 news_text += f" — {item.content[:150]}"
             news_text += "\n"
         
-        # Wywołaj LLM przez Node.js subprocess
-        prompt = f"""Analyze the following cryptocurrency news for {symbol} and provide a sentiment score.
+        prompt = f"""Analyze news sentiment for {symbol}:
 
-NEWS:
 {news_text}
 
-Respond ONLY with valid JSON in this exact format:
-{{"score": <float between -1.0 and 1.0>, "confidence": <float between 0.0 and 1.0>, "summary": "<one sentence explanation>"}}
-
-Scoring guide:
-- score > 0.5: Very bullish (positive news like adoption, ETF approval, institutional buying)
-- score 0.2-0.5: Mildly bullish
-- score -0.2 to 0.2: Neutral / mixed signals
-- score -0.5 to -0.2: Mildly bearish
-- score < -0.5: Very bearish (hacks, bans, regulatory crackdowns, major sell-offs)
-- confidence: how clear the sentiment is (0.3 = mixed/conflicting, 0.9 = very clear direction)"""
+Respond ONLY with valid JSON (no markdown):
+{{"score": <-1.0 to 1.0>, "confidence": <0.0 to 1.0>, "summary": "<one sentence>"}}"""
         
         try:
-            result = self._call_llm_sync(prompt)
-            return self._parse_llm_response(result, symbol, len(news_items))
+            response = _requests.post(
+                self.GLM_API_URL,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "glm-4-flash-250414",
+                    "messages": [
+                        {"role": "system", "content": "You are a financial news sentiment analyzer. Respond ONLY with valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 150,
+                },
+                timeout=15,
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return self._parse_response(content, symbol, len(news_items))
+            else:
+                logger.debug(f"[SentimentAnalyzer] API error {response.status_code}")
+                return self._rule_based_fallback(news_items, symbol)
+                
         except Exception as e:
-            print(f"[SentimentAnalyzer] LLM error: {e}")
+            logger.debug(f"[SentimentAnalyzer] Request error: {e}")
+            return self._rule_based_fallback(news_items, symbol)
+    
+    def _parse_response(self, response: str, symbol: str, news_count: int) -> SentimentScore:
+        """Parse JSON response."""
+        try:
+            json_str = response
+            if "{" in response:
+                start = response.index("{")
+                end = response.rindex("}") + 1
+                json_str = response[start:end]
+            
+            data = json.loads(json_str)
             return SentimentScore(
-                score=0.0,
-                confidence=0.0,
-                summary=f"LLM analysis failed: {str(e)[:100]}",
-                news_count=len(news_items),
+                score=max(-1.0, min(1.0, float(data.get("score", 0)))),
+                confidence=max(0.0, min(1.0, float(data.get("confidence", 0)))),
+                summary=str(data.get("summary", ""))[:200],
+                news_count=news_count,
                 timestamp=datetime.now(timezone.utc),
                 symbol=symbol,
             )
+        except Exception:
+            return self._rule_based_fallback([], symbol, news_count)
     
-    def _call_llm_sync(self, prompt: str) -> str:
-        """Wywołaj LLM przez Node.js subprocess (z-ai-web-dev-sdk)."""
-        import subprocess
-        import tempfile
+    def _rule_based_fallback(self, news_items: List[NewsItem], symbol: str, news_count: int = None) -> SentimentScore:
+        """Rule-based sentiment gdy GLM niedostępny."""
+        count = news_count or len(news_items)
         
-        # Stwórz Node.js skrypt
-        prompt_escaped = json.dumps(prompt)
-        script = f"""
-const ZAI = require('z-ai-web-dev-sdk').default;
-
-async function main() {{
-    const zai = await ZAI.create();
-    const completion = await zai.chat.completions.create({{
-        messages: [
-            {{ role: "system", content: "You are a financial news sentiment analyzer. Respond ONLY with valid JSON." }},
-            {{ role: "user", content: {prompt_escaped} }}
-        ],
-        temperature: 0.1,
-        max_tokens: 200,
-    }});
-    console.log(completion.choices[0]?.message?.content || "");
-}}
-
-main().catch(e => {{ console.error(e.message); process.exit(1); }});
-"""
+        BEARISH_WORDS = {"crash", "hack", "ban", "scam", "lawsuit", "bankrupt", "crash", "seized", "suspended", "fear"}
+        BULLISH_WORDS = {"rally", "surge", "approved", "etf", "adoption", "record", "bullish", "breakout", "halving"}
         
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
-            f.write(script)
-            script_path = f.name
+        if not news_items:
+            return SentimentScore(0.0, 0.0, "No news", count, datetime.now(timezone.utc), symbol)
         
-        try:
-            # Set NODE_PATH to find globally installed modules
-            import subprocess
-            env = os.environ.copy()
-            npm_root = subprocess.run(['npm', 'root', '-g'], capture_output=True, text=True).stdout.strip()
-            if npm_root:
-                env['NODE_PATH'] = npm_root
-            
-            result = subprocess.run(
-                ['node', script_path],
-                capture_output=True, text=True, timeout=30,
-                env=env,
-            )
-            return result.stdout.strip()
-        finally:
-            os.unlink(script_path)
-    
-    def _parse_llm_response(self, response: str, symbol: str, news_count: int) -> SentimentScore:
-        """Parse LLM JSON response into SentimentScore."""
-        # Extract JSON from response (may have markdown code blocks)
-        json_str = response
-        if "```json" in json_str:
-            json_str = json_str.split("```json")[1].split("```")[0]
-        elif "```" in json_str:
-            json_str = json_str.split("```")[1].split("```")[0]
+        score = 0.0
+        for item in news_items[:10]:
+            title_lower = item.title.lower()
+            if any(w in title_lower for w in BEARISH_WORDS):
+                score -= 0.15
+            if any(w in title_lower for w in BULLISH_WORDS):
+                score += 0.15
         
-        data = json.loads(json_str.strip())
+        score = max(-1.0, min(1.0, score))
         
         return SentimentScore(
-            score=max(-1.0, min(1.0, float(data.get("score", 0)))),
-            confidence=max(0.0, min(1.0, float(data.get("confidence", 0)))),
-            summary=str(data.get("summary", ""))[:200],
-            news_count=news_count,
+            score=score,
+            confidence=0.4,
+            summary=f"Rule-based: {count} articles analyzed",
+            news_count=count,
             timestamp=datetime.now(timezone.utc),
             symbol=symbol,
         )

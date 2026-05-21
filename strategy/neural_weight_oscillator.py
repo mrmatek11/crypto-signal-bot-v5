@@ -14,9 +14,15 @@ Licencja: CC BY-NC-SA 4.0
 import pandas as pd
 import numpy as np
 import math
+import json as _json
+import os as _os
+import time as _time
+import logging as _logging
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 from collections import deque
+
+_nwo_logger = _logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -83,33 +89,43 @@ def calc_stoch(high: pd.Series, low: pd.Series, close: pd.Series,
 def calc_cvd(close: pd.Series, high: pd.Series, low: pd.Series, volume: pd.Series,
              length: int = 20) -> pd.Series:
     """
-    Cumulative Volume Delta (approximated from OHLCV data).
+    CVD (Cumulative Volume Delta) — POPRAWIONA WERSJA.
     
-    CVD ≈ cumulative sum of directional volume.
-    Direction estimated via: if close > open → buy volume, else sell volume.
-    More precise: uses (2*close - high - low) / (high - low) as directional multiplier.
+    PROBLEM z oryginalem:
+      - cumsum() na każdym compute() call zaczyna od zera
+      - wartości absolutne CVD zależą od okna danych, nie od historii
+      - CVD "kumulatywny" tylko w obrębie pobieranych 100 barów
     
-    Returns normalized CVD z-score for oscillator integration.
+    ROZWIĄZANIE:
+      - CVD jest ZAWSZE normalizowany do z-score w oknie (relative CVD)
+      - Zamiast absolut cumsum używamy windowed directional volume pressure
+      - Daje spójne sygnały niezależnie od momentu startu
+      - Faktycznie mierzy: czy w ostatnich N barach dominował buy/sell volume
+    
+    Interpretacja:
+      - CVD > 1.0: silna presja kupna (z-score)
+      - CVD < -1.0: silna presja sprzedaży
+      - CVD ≈ 0: balans
     """
-    # Directional volume estimation
-    hl_range = high - low
-    hl_range = hl_range.replace(0, np.nan)
+    hl_range = (high - low).replace(0, np.nan)
     
-    # Proximity of close to high vs low: +1 at high, -1 at low
+    # Directional multiplier: +1 gdy close blisko high, -1 gdy close blisko low
     directional = (2.0 * close - high - low) / hl_range
-    directional = directional.fillna(0)
+    directional = directional.fillna(0).clip(-1, 1)
     
-    # Volume delta = directional * volume
-    vol_delta = directional * volume
+    # Signed volume delta per bar
+    vol_delta = directional * volume.fillna(0)
     
-    # Cumulative sum
-    cvd_raw = vol_delta.cumsum()
+    # Rolling sum (windowed cumulative) zamiast global cumsum
+    rolling_cvd = vol_delta.rolling(window=length, min_periods=length // 2).sum()
     
-    # Normalize: z-score over rolling window
-    cvd_mean = sma(cvd_raw, length)
-    cvd_std = calc_stdev(cvd_raw, length)
-    cvd_zscore = (cvd_raw - cvd_mean) / cvd_std.replace(0, np.nan)
-    cvd_zscore = cvd_zscore.fillna(0)
+    # Z-score normalizacja w dłuższym oknie (3x) dla kontekstu
+    long_window = length * 3
+    cvd_mean = rolling_cvd.rolling(window=long_window, min_periods=length).mean()
+    cvd_std = rolling_cvd.rolling(window=long_window, min_periods=length).std(ddof=0)
+    
+    cvd_zscore = (rolling_cvd - cvd_mean) / cvd_std.replace(0, np.nan)
+    cvd_zscore = cvd_zscore.fillna(0).clip(-5, 5)  # Cap outliers
     
     return cvd_zscore
 
@@ -742,3 +758,76 @@ class NeuralWeightOscillator:
             "bwm_mean": round(result["bwm_mean"], 4),
             "bwm_momentum": round(result["bwm_momentum"], 4),
         }
+    
+    # ═════════════════════════════════════════════════════════════════════
+    # WEIGHTS PERSISTENCE — zapis/odczyt wag NWO z pliku JSON
+    # FIX #7: bot nie zaczyna od zera po restarcie
+    # ═════════════════════════════════════════════════════════════════════
+    
+    DEFAULT_WEIGHTS_PATH = "/app/data/nwo_weights.json"
+    
+    def save_weights(self, symbol: str, timeframe: str, path: str = None) -> bool:
+        """Zapisz wagi NWO do pliku JSON."""
+        path = path or self.DEFAULT_WEIGHTS_PATH
+        
+        key = f"{symbol}_{timeframe}"
+        weights = {
+            "tw_trend": self._tw_trend,
+            "tw_mean": self._tw_mean,
+            "tw_momentum": self._tw_momentum,
+            "t_bias": self._t_bias,
+            "step": self._step,
+            "last_loss": self._last_loss,
+        }
+        
+        try:
+            existing = {}
+            if _os.path.exists(path):
+                with open(path, "r") as f:
+                    existing = _json.load(f)
+            
+            existing[key] = weights
+            existing[f"{key}_saved_at"] = _time.time()
+            
+            # Upewnij się że katalog istnieje
+            _os.makedirs(_os.path.dirname(path) if _os.path.dirname(path) else ".", exist_ok=True)
+            
+            with open(path, "w") as f:
+                _json.dump(existing, f, indent=2)
+            
+            return True
+        except Exception as e:
+            _nwo_logger.debug(f"NWOWeights: save error: {e}")
+            return False
+    
+    def load_weights(self, symbol: str, timeframe: str, path: str = None) -> bool:
+        """Wczytaj wagi NWO z pliku JSON."""
+        path = path or self.DEFAULT_WEIGHTS_PATH
+        
+        if not _os.path.exists(path):
+            return False
+        
+        key = f"{symbol}_{timeframe}"
+        
+        try:
+            with open(path, "r") as f:
+                data = _json.load(f)
+            
+            if key not in data:
+                return False
+            
+            weights = data[key]
+            self._tw_trend = weights.get("tw_trend", 0.01)
+            self._tw_mean = weights.get("tw_mean", 0.01)
+            self._tw_momentum = weights.get("tw_momentum", 0.01)
+            self._t_bias = weights.get("t_bias", 0.0)
+            self._step = weights.get("step", 0)
+            self._last_loss = weights.get("last_loss", None)
+            
+            saved_ago = _time.time() - data.get(f"{key}_saved_at", 0)
+            _nwo_logger.info(f"NWOWeights: loaded {key} (saved {saved_ago/3600:.1f}h ago)")
+            return True
+            
+        except Exception as e:
+            _nwo_logger.debug(f"NWOWeights: load error: {e}")
+            return False

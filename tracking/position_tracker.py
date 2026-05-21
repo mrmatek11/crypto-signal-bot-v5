@@ -27,6 +27,7 @@ import os
 import sqlite3
 import time
 import json
+import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
@@ -105,11 +106,15 @@ class PositionTracker:
         self.default_size_usd = default_size_usd
         self.max_open = max_open
         self._conn = None
+        self._mutex = threading.Lock()  # FIX #8: Mutex dla concurrent access (SQLite race condition)
         self._init_db()
 
     def _init_db(self):
         """Inicjalizuj bazę SQLite."""
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # FIX #8: WAL mode + busy timeout dla concurrent access
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")  # 5s timeout na lock
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("""
@@ -171,7 +176,12 @@ class PositionTracker:
 
     # ─── Open / Close ──────────────────────────────────────────────────────
 
-    def open_position(
+    def open_position(self, *args, **kwargs):
+        """Otwórz pozycję z mutex (FIX #8: concurrent access)."""
+        with self._mutex:
+            return self._open_position_impl(*args, **kwargs)
+    
+    def _open_position_impl(
         self,
         symbol: str,
         direction: str,
@@ -247,7 +257,12 @@ class PositionTracker:
         print(f"[PositionTracker] Opened {direction} {symbol} @ ${actual_entry:,.2f} | SL=${sl:,.2f} TP=${tp:,.2f} (id={pos.id})")
         return pos
 
-    def close_position(
+    def close_position(self, *args, **kwargs):
+        """Zamknij pozycję z mutex (FIX #8: concurrent access)."""
+        with self._mutex:
+            return self._close_position_impl(*args, **kwargs)
+    
+    def _close_position_impl(
         self,
         position_id: int,
         close_price: float,
@@ -331,7 +346,12 @@ class PositionTracker:
 
     # ─── Auto-close on SL/TP ──────────────────────────────────────────────
 
-    def check_closes(
+    def check_closes(self, *args, **kwargs):
+        """Sprawdź SL/TP z mutex (FIX #8: concurrent access)."""
+        with self._mutex:
+            return self._check_closes_impl(*args, **kwargs)
+    
+    def _check_closes_impl(
         self,
         current_prices: Dict[str, float],
     ) -> List[Position]:
@@ -393,31 +413,33 @@ class PositionTracker:
     # ─── Queries ──────────────────────────────────────────────────────────
 
     def get_open_positions(self, symbol: str = None) -> List[Position]:
-        """Pobierz otwarte pozycje."""
-        if symbol:
-            rows = self._conn.execute(
-                "SELECT * FROM positions WHERE is_open = 1 AND symbol = ? ORDER BY opened_at DESC",
-                (symbol,)
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM positions WHERE is_open = 1 ORDER BY opened_at DESC"
-            ).fetchall()
-        return [self._row_to_position(r) for r in rows]
+        """Pobierz otwarte pozycje z mutex (FIX #8)."""
+        with self._mutex:
+            if symbol:
+                rows = self._conn.execute(
+                    "SELECT * FROM positions WHERE is_open = 1 AND symbol = ? ORDER BY opened_at DESC",
+                    (symbol,)
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM positions WHERE is_open = 1 ORDER BY opened_at DESC"
+                ).fetchall()
+            return [self._row_to_position(r) for r in rows]
 
     def get_open_position(self, symbol: str, direction: str = None) -> Optional[Position]:
-        """Pobierz otwartą pozycję dla symbolu (i opcjonalnie kierunku)."""
-        if direction:
-            row = self._conn.execute(
-                "SELECT * FROM positions WHERE is_open = 1 AND symbol = ? AND direction = ? LIMIT 1",
-                (symbol, direction)
-            ).fetchone()
-        else:
-            row = self._conn.execute(
-                "SELECT * FROM positions WHERE is_open = 1 AND symbol = ? LIMIT 1",
-                (symbol,)
-            ).fetchone()
-        return self._row_to_position(row) if row else None
+        """Pobierz otwartą pozycję z mutex (FIX #8)."""
+        with self._mutex:
+            if direction:
+                row = self._conn.execute(
+                    "SELECT * FROM positions WHERE is_open = 1 AND symbol = ? AND direction = ? LIMIT 1",
+                    (symbol, direction)
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT * FROM positions WHERE is_open = 1 AND symbol = ? LIMIT 1",
+                    (symbol,)
+                ).fetchone()
+            return self._row_to_position(row) if row else None
 
     def get_open_count(self, symbol: str = None) -> int:
         """Ile otwartych pozycji."""
@@ -620,7 +642,7 @@ class PositionTracker:
         open_positions = self.get_open_positions()
         for pos in open_positions:
             price = current_prices.get(pos.symbol, pos.entry_price)
-            result = self.close_position(pos.id, price, reason)
+            result = self._close_position_impl(pos.id, price, reason)  # Already inside mutex from check_closes
             if result:
                 closed.append(result)
         return closed

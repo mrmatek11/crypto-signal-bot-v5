@@ -19,6 +19,7 @@ import time
 import json
 import logging
 import hashlib
+import random
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field
@@ -35,21 +36,22 @@ logger = logging.getLogger(__name__)
 
 class GLMClient:
     """
-    Klient API Zhipu AI ChatGLM.
+    Klient API Zhipu AI ChatGLM — z exponential backoff i masked logging.
     
-    Endpoints:
-      - https://open.bigmodel.cn/api/paas/v4/chat/completions
-    
-    Autoryzacja: Bearer token (JWT z API key)
+    POPRAWKI vs oryginał:
+      - Exponential backoff na 429 (zamiast sleep(5) + return None)
+      - API key masked w logach (tylko pierwsze 8 znaków)
+      - Max retries configurable
+      - Jitter żeby uniknąć thundering herd przy wielu symbolach
     """
     
     API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     
-    def __init__(self, api_key: str, model: str = "glm-4-flash"):
+    def __init__(self, api_key: str, model: str = "glm-4-flash-250414"):
         """
         Args:
             api_key: Zhipu AI API key (format: <id>.<secret>)
-            model: Model name (glm-4-flash, glm-4, glm-4-plus)
+            model: Model name (glm-4-flash-250414, glm-4, glm-4-plus)
         """
         self.api_key = api_key
         self.model = model
@@ -58,6 +60,9 @@ class GLMClient:
         self._request_count = 0
         self._last_request_time = 0
         self._errors = 0
+        
+        # Masked key dla logów — nigdy nie loguj pełnego klucza
+        self._masked_key = f"{api_key[:8]}..." if len(api_key) > 8 else "***"
     
     def _generate_token(self) -> str:
         """Generate JWT token from API key."""
@@ -65,34 +70,27 @@ class GLMClient:
             import jwt
             api_key_parts = self.api_key.split('.')
             if len(api_key_parts) != 2:
-                # Fallback: use raw key as Bearer token
                 return self.api_key
             
             api_id, api_secret = api_key_parts
-            
             now = int(time.time())
             payload = {
                 "api_key": api_id,
-                "exp": now + 3600,  # 1 hour
+                "exp": now + 3600,
                 "timestamp": now,
             }
-            
             token = jwt.encode(
-                payload,
-                api_secret,
-                algorithm="HS256",
+                payload, api_secret, algorithm="HS256",
                 headers={"alg": "HS256", "sign_type": "SIGN"},
             )
             self._token = token
             self._token_expires = now + 3500
             return token
-            
         except ImportError:
-            # pyjwt not installed, use raw key
-            logger.warning("pyjwt nie zainstalowany - uzywanie raw API key. pip install pyjwt")
+            logger.warning("[GLM] pyjwt nie zainstalowany. pip install pyjwt")
             return self.api_key
         except Exception as e:
-            logger.debug(f"JWT generation failed: {e}, using raw key")
+            logger.debug(f"[GLM] JWT error: {e}")
             return self.api_key
     
     def _get_token(self) -> str:
@@ -107,31 +105,26 @@ class GLMClient:
         temperature: float = 0.3,
         max_tokens: int = 1000,
         timeout: int = 30,
+        max_retries: int = 3,
     ) -> Optional[str]:
         """
-        Send chat completion request to GLM API.
+        Send chat completion z exponential backoff na rate limiting.
         
-        Args:
-            messages: List of {"role": "system"/"user"/"assistant", "content": "..."}
-            temperature: 0.0-1.0 (lower = more deterministic)
-            max_tokens: Max response tokens
-            timeout: Request timeout in seconds
-            
-        Returns:
-            Response text or None on error
+        FIX vs oryginał:
+          - max_retries zamiast jednego try
+          - Exponential backoff: 5s -> 15s -> 45s z ±20% jitter
+          - API key nigdy nie pojawia się w logach
         """
-        # Rate limit: min 1s between requests
+        # Min 1s między requestami (rate limit prewencja)
         elapsed = time.time() - self._last_request_time
         if elapsed < 1.0:
             time.sleep(1.0 - elapsed)
         
         token = self._get_token()
-        
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        
         payload = {
             "model": self.model,
             "messages": messages,
@@ -139,38 +132,64 @@ class GLMClient:
             "max_tokens": max_tokens,
         }
         
-        try:
-            response = requests.post(
-                self.API_URL,
-                headers=headers,
-                json=payload,
-                timeout=timeout,
-            )
-            
-            self._request_count += 1
-            self._last_request_time = time.time()
-            
-            if response.status_code == 200:
-                data = response.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                return content.strip()
-            elif response.status_code == 429:
-                logger.warning("[GLM] Rate limited, backing off")
-                time.sleep(5)
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    self.API_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout,
+                )
+                
+                self._request_count += 1
+                self._last_request_time = time.time()
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    return content.strip()
+                
+                elif response.status_code == 429:
+                    # Exponential backoff: 5, 15, 45 sekund + jitter
+                    wait = (5 ** (attempt + 1)) * (0.8 + random.random() * 0.4)
+                    logger.warning(
+                        f"[GLM] Rate limited (429), attempt {attempt+1}/{max_retries}, "
+                        f"waiting {wait:.1f}s — key: {self._masked_key}"
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(wait)
+                        continue
+                    return None
+                
+                elif response.status_code == 401:
+                    logger.error(f"[GLM] Auth failed (401) — sprawdź klucz API: {self._masked_key}")
+                    return None
+                
+                elif response.status_code in (500, 502, 503):
+                    wait = 10 * (attempt + 1)
+                    logger.warning(f"[GLM] Server error {response.status_code}, retry {attempt+1}/{max_retries} in {wait}s")
+                    time.sleep(wait)
+                    continue
+                
+                else:
+                    logger.warning(f"[GLM] API error {response.status_code}: {response.text[:100]}")
+                    self._errors += 1
+                    return None
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"[GLM] Timeout (attempt {attempt+1}/{max_retries})")
+                self._errors += 1
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
                 return None
-            else:
-                logger.warning(f"[GLM] API error {response.status_code}: {response.text[:200]}")
+            
+            except Exception as e:
+                logger.warning(f"[GLM] Request error: {type(e).__name__}: {str(e)[:100]}")
                 self._errors += 1
                 return None
-                
-        except requests.exceptions.Timeout:
-            logger.warning("[GLM] Request timeout")
-            self._errors += 1
-            return None
-        except Exception as e:
-            logger.warning(f"[GLM] Request error: {e}")
-            self._errors += 1
-            return None
+        
+        return None
     
     @property
     def stats(self) -> dict:
@@ -179,6 +198,7 @@ class GLMClient:
             "requests": self._request_count,
             "errors": self._errors,
             "has_key": bool(self.api_key),
+            # NIGDY nie dodawaj api_key do stats!
         }
 
 
@@ -263,7 +283,7 @@ class GLMAnalyst:
     def __init__(
         self,
         api_key: str = "",
-        model: str = "glm-4-flash",
+        model: str = "glm-4-flash-250414",
         enabled: bool = True,
         language: str = "pl",   # pl, en
         # Feature toggles (can disable individual features)

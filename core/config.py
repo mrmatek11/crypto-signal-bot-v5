@@ -29,24 +29,16 @@ class BotConfig:
     rate_limit_ms: int = 500                      # ms miedzy requestami
     cache_ttl: int = 30                           # sekundy cache'u
 
-    # --- Watchlist (Crypto) -------------------------------------------------
+    # --- Watchlist (Crypto) — ograniczone do top 2 + SOL jako opcja ---
     symbols: List[str] = field(default_factory=lambda: [
         "BTC/USDT",
         "ETH/USDT",
-        "SOL/USDT",
-        "BNB/USDT",
-        "XRP/USDT",
-        "ADA/USDT",
-        "DOGE/USDT",
-        "AVAX/USDT",
-        "DOT/USDT",
-        "LINK/USDT",
     ])
 
     timeframes: List[str] = field(default_factory=lambda: [
-        "5m",
         "15m",
         "1h",
+        "4h",
     ])
 
     # --- Multi-Asset Symbols ------------------------------------------------
@@ -64,8 +56,8 @@ class BotConfig:
     # Indeksy globalne
     index_symbols: List[str] = field(default_factory=lambda: [
         "SP500",        # S&P 500 (via SPY ETF)
+        "NASDAQ",       # NASDAQ 100 (via QQQ ETF)
         "DAX",          # DAX (Niemcy)
-        "NIKKEI",       # Nikkei 225 (Japonia)
         "WIG",          # WIG (GPW Polska)
     ])
 
@@ -85,12 +77,12 @@ class BotConfig:
     volume_mult: float = 1.5
 
     # --- Trend Filter -------------------------------------------------------
-    trend_filter_mode: str = "alert"              # "alert", "block", "off"
+    trend_filter_mode: str = "block"              # "alert", "block", "off" — blokuj against-trend (lepszy WR)
 
     # --- Scanning -----------------------------------------------------------
     scan_interval: int = 60                      # Sekundy miedzy skanami
     candles_per_fetch: int = 100                 # Ile swiec pobierac
-    cooldown_per_signal: int = 300               # Sekundy cooldown dla tego samego sygnalu
+    cooldown_per_signal: int = 900               # Sekundy cooldown dla tego samego sygnalu (15 min)
 
     # --- AI News Sentiment --------------------------------------------------
     use_sentiment: bool = False                  # Wlacz AI news sentiment filter
@@ -101,7 +93,7 @@ class BotConfig:
     sentiment_block_threshold: float = 0.5       # |score| > tego -> blokuj sygnal
 
     # --- Market Data Source -------------------------------------------------
-    market_source: str = "crypto"                  # "crypto", "stocks", "both"
+    market_source: str = "both"                     # "crypto", "stocks", "both" — domyślnie both (crypto+tradfi)
     # crypto = tylko Binance (ccxt)
     # stocks = tylko YFinance
     # both = auto-wybierz zrodlo (crypto->Binance, reszta->YFinance)
@@ -115,7 +107,7 @@ class BotConfig:
     # --- GLM AI Analyst ----------------------------------------------------
     use_glm_analyst: bool = False                # Wlacz GLM AI Analyst
     glm_api_key: str = ""                        # Also reads from GLM_API_KEY env var
-    glm_model: str = "glm-4-flash"              # glm-4-flash (fast/cheap), glm-4, glm-4-plus
+    glm_model: str = "glm-4-flash-250414"       # glm-4-flash-250414 (fast/cheap), glm-4, glm-4-plus
     glm_language: str = "pl"                     # pl, en
 
     # GLM features (can toggle individual features)
@@ -133,7 +125,7 @@ class BotConfig:
     scanner_sessions: bool = True                # Session Reporter (Azja/Europa/US)
     scanner_correlation: bool = True             # Correlation Alert
     scanner_pulse_interval: int = 3600           # Co ile sekund Market Pulse (default: 1h)
-    scanner_volatility_threshold: float = 2.0    # current/avg vol > tego = alert
+    scanner_volatility_threshold: float = 3.0    # current/avg vol > tego = alert (podniesione = mniej spamu)
     scanner_sr_lookback: int = 50                # Ile swiec do detekcji S/R
     scanner_sr_proximity_pct: float = 1.0        # % odleglosci do S/R alert
     scanner_corr_threshold: float = 0.3          # Min rozstep korelacji do alertu
@@ -238,8 +230,17 @@ class BotConfig:
             errors.append("use_glm_analyst=True ale glm_api_key jest puste! Ustaw GLM_API_KEY")
         return errors
 
+    @staticmethod
+    def _mask_secret(secret: str, show_chars: int = 8) -> str:
+        """Maskuje sekret do logów — pokazuje tylko pierwsze N znaków."""
+        if not secret:
+            return "(not set)"
+        if len(secret) <= show_chars:
+            return "***"
+        return f"{secret[:show_chars]}..."
+
     def summary(self) -> str:
-        """Zwraca podsumowanie konfiguracji."""
+        """Zwraca podsumowanie konfiguracji z zamaskowanymi sekretami."""
         trend_icon = {"alert": "!!", "block": "X", "off": "-"}.get(self.trend_filter_mode, "?")
         all_syms = self.get_all_symbols()
         crypto_count = len(self.symbols)
@@ -261,6 +262,9 @@ class BotConfig:
             f"Market: {self.market_source}\n"
             f"AI Sentiment: {'YES' if self.use_sentiment else 'NO'}\n"
             f"GLM AI Analyst: {'YES' if self.use_glm_analyst else 'NO'} (model={self.glm_model})\n"
+            f"GLM API Key: {self._mask_secret(self.glm_api_key)}\n"
+            f"CryptoPanic Key: {self._mask_secret(self.cryptopanic_api_key)}\n"
+            f"Finnhub Key: {self._mask_secret(self.finnhub_api_key)}\n"
             f"  - Signal Scorer: {'YES' if self.glm_signal_scorer else 'NO'}\n"
             f"  - Daily Briefing: {'YES' if self.glm_daily_briefing else 'NO'}\n"
             f"  - Regime Detector: {'YES' if self.glm_regime_detector else 'NO'}\n"

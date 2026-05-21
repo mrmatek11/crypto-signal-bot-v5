@@ -70,11 +70,15 @@ TP_ATR_MULT = 4.5
 #   "alert" = alertuj z ostrzeżeniem ⚠️ (default)
 #   "block" = całkowita blokada — nie alertuj w ogóle
 #   "off"   = brak filtra trendu
-TREND_FILTER_MODE = "alert"
+TREND_FILTER_MODE = "block"
 
 
 def get_nwo_instance(symbol: str, timeframe: str, config: NWOConfig = None) -> NeuralWeightOscillator:
-    """Get or create persistent NWO instance PER symbol+timeframe."""
+    """Get or create persistent NWO instance PER symbol+timeframe.
+    
+    FIX #7: Po utworzeniu instancji, próbuje wczytać zapisane wagi z pliku JSON.
+    Dzięki temu bot nie zaczyna od zera po restarcie.
+    """
     global _nwo_config
     if config is None:
         config = NWOConfig()
@@ -87,8 +91,24 @@ def get_nwo_instance(symbol: str, timeframe: str, config: NWOConfig = None) -> N
     
     if key not in _nwo_instances:
         _nwo_instances[key] = NeuralWeightOscillator(config)
+        # FIX #7: Wczytaj zapisane wagi (jeśli istnieją)
+        try:
+            _nwo_instances[key].load_weights(symbol, timeframe)
+        except Exception:
+            pass  # Pierwszy start — nie ma zapisanych wag, OK
     
     return _nwo_instances[key]
+
+
+def save_all_nwo_weights(path: str = None):
+    """Zapisz wagi wszystkich instancji NWO do pliku (do wywołania cyklicznie)."""
+    for key, nwo in _nwo_instances.items():
+        try:
+            parts = key.split("_", 1)
+            if len(parts) == 2:
+                nwo.save_weights(parts[0], parts[1], path)
+        except Exception:
+            pass
 
 
 def strategy_nwo_stoch_cvd(df: pd.DataFrame, symbol: str, timeframe: str) -> List[Signal]:

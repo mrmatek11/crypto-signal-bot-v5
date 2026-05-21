@@ -181,7 +181,7 @@ MARKET_EMOJI = {
 # Pełne nazwy instrumentów
 INSTRUMENT_NAMES = {
     "SP500": "S&P 500",
-    "US100": "NASDAQ 100",
+    "NASDAQ": "NASDAQ 100",
     "DAX": "DAX 40",
     "NIKKEI": "Nikkei 225",
     "WIG": "WIG (via EPOL)",

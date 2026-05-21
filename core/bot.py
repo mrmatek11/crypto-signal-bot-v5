@@ -268,6 +268,19 @@ class StochSignalBot:
         # --- Custom strategy ---
         self.custom_strategy_fn = None
 
+        # --- Signal Performance Tracker + Self-Learning Filter ---
+        self.signal_tracker = None
+        self.self_learning_filter = None
+        try:
+            from tracking.signal_performance import SignalPerformanceTracker, SelfLearningFilter
+            self.signal_tracker = SignalPerformanceTracker(
+                db_path=config.position_db_path.replace("positions.db", "signal_performance.db")
+            )
+            self.self_learning_filter = SelfLearningFilter(self.signal_tracker)
+            logger.info("Signal Performance Tracker + Self-Learning Filter: ENABLED")
+        except Exception as e:
+            logger.warning(f"Signal tracker init failed: {e}")
+
         # --- Apply trend filter mode ---
         if config.trend_filter_mode:
             try:
@@ -479,6 +492,41 @@ class StochSignalBot:
                                 except Exception:
                                     pass
 
+                            # --- Self-Learning Filter ---
+                            if self.self_learning_filter:
+                                filter_data = {
+                                    "source": sig.extra_data.get("source", "STOCH-ONLY"),
+                                    "timeframe": sig.timeframe,
+                                    "against_trend": sig.extra_data.get("against_trend", False),
+                                }
+                                should_send, filter_reason = self.self_learning_filter.should_send(filter_data)
+                                if not should_send:
+                                    logger.info(f"    FILTERED: {symbol} {sig.signal_type} — {filter_reason}")
+                                    continue
+
+                            # --- Record signal PRZED wysłaniem ---
+                            record_id = None
+                            if self.signal_tracker:
+                                record_id = self.signal_tracker.record_signal({
+                                    "symbol": sig.symbol,
+                                    "timeframe": sig.timeframe,
+                                    "direction": sig.signal_type,
+                                    "source": sig.extra_data.get("source", "STOCH-ONLY"),
+                                    "price": sig.price,
+                                    "sl": sig.extra_data.get("sl", 0),
+                                    "tp": sig.extra_data.get("tp", 0),
+                                    "stoch_k": sig.k_value,
+                                    "stoch_d": sig.d_value,
+                                    "nwo_histogram": sig.extra_data.get("histogram", 0),
+                                    "cvd": sig.extra_data.get("cvd", 0),
+                                    "trend": sig.extra_data.get("trend", "?"),
+                                    "against_trend": sig.extra_data.get("against_trend", False),
+                                    "confidence": sig.extra_data.get("confidence", "MEDIUM"),
+                                    "glm_score": sig.extra_data.get("glm_score"),
+                                    "glm_recommendation": sig.extra_data.get("glm_recommendation"),
+                                })
+                                sig.extra_data["perf_record_id"] = record_id
+
                             # Send to Discord
                             sent = False
                             if self.notifier and not self.test_mode:
@@ -587,6 +635,23 @@ class StochSignalBot:
             stale = [k for k, v in self._cooldowns.items() if now - v > self.config.cooldown_per_signal]
             for k in stale:
                 del self._cooldowns[k]
+
+        # --- NWO weights persistence (co 10 cykli ~10 min) ---
+        if self._scan_count % 10 == 0:
+            try:
+                from strategy.custom_strategy import save_all_nwo_weights
+                save_all_nwo_weights()
+            except Exception:
+                pass
+
+        # --- Signal Performance Weekly Report (co 168 cykli ~3h, docelowo 1/tydzień) ---
+        if self.signal_tracker and self.notifier and self._scan_count % 168 == 0 and not self.test_mode:
+            try:
+                embed = self.signal_tracker.format_discord_embed(days=7)
+                self.notifier.send_custom_embed(embed)
+                logger.info("Weekly Signal Performance Report sent to Discord")
+            except Exception:
+                pass
 
         # --- Periodic stats ---
         if self.position_tracker and self._scan_count % 10 == 0:
@@ -908,6 +973,19 @@ class StochSignalBot:
 
     def _send_position_close_notification(self, pos):
         """Wyslij powiadomienie o zamknieciu pozycji na Discord."""
+        # --- Signal Tracker: zamknij sygnał ---
+        if self.signal_tracker:
+            try:
+                outcome = "WIN" if pos.pnl and pos.pnl > 0 else "LOSS"
+                self.signal_tracker.close_signal_by_symbol(
+                    symbol=pos.symbol,
+                    direction=pos.direction,
+                    close_price=pos.close_price or 0,
+                    outcome=outcome,
+                )
+            except Exception:
+                pass
+
         if not self.notifier:
             return
 

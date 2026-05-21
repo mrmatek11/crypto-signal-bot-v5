@@ -696,20 +696,22 @@ class NewsMonitor:
         return True
 
     def _cleanup_seen_urls(self) -> None:
-        """Usun stare wpisy z dedup cache (TTL)."""
+        """
+        Usuń stare wpisy z dedup cache (TTL).
+        
+        FIX: oryginał zakładał że OrderedDict jest posortowany po timestamp value
+        i używał `break` przy pierwszym nie-wygasłym wpisie — BŁĄD.
+        
+        Poprawka: iteruj przez wszystkie wpisy i usuń każdy wygasły.
+        Nie używaj `break` — czas wstawienia != timestamp value.
+        """
         now = time.time()
-        expired_keys = []
-
-        for key, ts in self._seen_urls.items():
-            if now - ts > self._seen_ttl:
-                expired_keys.append(key)
-            else:
-                # OrderedDict jest posortowany po insercie,
-                # wiec jesli ten nie wygasl, kolejne tez nie
-                break
-
+        expired_keys = [
+            key for key, ts in self._seen_urls.items()
+            if now - ts > self._seen_ttl
+        ]
         for key in expired_keys:
             del self._seen_urls[key]
-
+        
         if expired_keys:
             logger.debug(f"NewsMonitor: cleaned {len(expired_keys)} expired dedup entries")

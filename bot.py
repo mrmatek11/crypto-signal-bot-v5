@@ -80,7 +80,14 @@ class StochSignalBot:
             rsi_overbought=config.rsi_overbought,
             volume_filter=config.volume_filter,
             volume_mult=config.volume_mult,
+            use_closed_bar=config.use_closed_bar,
         )
+        # Propagate closed-bar mode do custom_strategy
+        try:
+            from strategy.custom_strategy import set_closed_bar_mode
+            set_closed_bar_mode(config.use_closed_bar)
+        except ImportError:
+            pass
 
         # --- Data fetcher (crypto / stocks / unified) ---
         self._yf_fetcher = None
@@ -137,8 +144,11 @@ class StochSignalBot:
                     timeout_hours=config.position_timeout_hours,
                     default_size_usd=config.default_position_size_usd,
                     max_open=config.max_open_positions,
+                    apply_slippage=config.apply_slippage,
+                    slippage_pct=config.slippage_pct,
                 )
-                logger.info(f"Position tracker: ENABLED (db={config.position_db_path})")
+                slip_state = f"slip={config.slippage_pct*100:.2f}%" if config.apply_slippage else "slip=OFF"
+                logger.info(f"Position tracker: ENABLED (db={config.position_db_path}, {slip_state})")
             except Exception as e:
                 logger.warning(f"Position tracker init failed: {e}")
 
@@ -413,11 +423,12 @@ class StochSignalBot:
             except Exception as e:
                 logger.warning(f"Early session check error: {e}")
 
-        # --- Position tracker: check SL/TP closes ---
+        # --- Position tracker: check SL/TP closes (intra-bar) ---
         if self.position_tracker:
             try:
                 current_prices = self._get_current_prices()
-                closed_positions = self.position_tracker.check_closes(current_prices)
+                current_bars = self._get_current_bars()
+                closed_positions = self.position_tracker.check_closes(current_prices, current_bars)
                 for pos in closed_positions:
                     emoji = "WIN" if pos.pnl and pos.pnl > 0 else "LOSS"
                     logger.info(f"  {emoji} POSITION CLOSED: {pos.direction} {pos.symbol} @ ${pos.close_price:,.2f} | PnL: ${pos.pnl:+,.2f}")
@@ -444,11 +455,16 @@ class StochSignalBot:
                     signals = self._check_symbol(symbol, timeframe)
                     if signals:
                         for sig in signals:
-                            # Check cooldown
+                            # Check cooldown — silniejszy sygnal moze nadpisac slabszy
                             cooldown_key = f"{sig.symbol}_{sig.timeframe}_{sig.signal_type}"
+                            sig_strength = self._signal_strength(sig)
                             if self._is_on_cooldown(cooldown_key):
-                                logger.debug(f"    {symbol}: sygnal {sig.signal_type} na cooldown")
-                                continue
+                                prev_strength = self._cooldown_strength(cooldown_key)
+                                if sig_strength <= prev_strength:
+                                    logger.debug(f"    {symbol}: sygnal {sig.signal_type} na cooldown (strength {sig_strength} <= prev {prev_strength})")
+                                    continue
+                                else:
+                                    logger.info(f"    {symbol}: {sig.signal_type} OVERRIDE — nowy strength {sig_strength} > prev {prev_strength}")
 
                             # --- GLM AI Signal Scorer ---
                             if self.glm_analyst and self.config.glm_signal_scorer:
@@ -579,7 +595,11 @@ class StochSignalBot:
 
                             if sent:
                                 self._signals_sent += 1
-                                self._cooldowns[cooldown_key] = time.time()
+                                self._cooldowns[cooldown_key] = {
+                                    "ts": time.time(),
+                                    "strength": sig_strength,
+                                    "source": sig.extra_data.get("source", "?"),
+                                }
                                 total_signals += 1
 
                                 glm_tag = ""
@@ -675,7 +695,11 @@ class StochSignalBot:
         # --- Clean stale cooldowns ---
         if self._scan_count % 20 == 0:
             now = time.time()
-            stale = [k for k, v in self._cooldowns.items() if now - v > self.config.cooldown_per_signal]
+            stale = []
+            for k, v in self._cooldowns.items():
+                ts = v["ts"] if isinstance(v, dict) else v
+                if now - ts > self.config.cooldown_per_signal:
+                    stale.append(k)
             for k in stale:
                 del self._cooldowns[k]
 
@@ -769,6 +793,33 @@ class StochSignalBot:
                         prices[symbol] = df['close'].iloc[-1]
             except Exception:
                 pass
+
+        return prices
+
+    def _get_current_bars(self) -> Dict[str, Dict[str, float]]:
+        """
+        Pobierz aktualny BAR (high/low/close) najnizszego TF dla otwartych pozycji.
+        Uzywane przez position_tracker do INTRA-BAR detekcji SL/TP — knoty swiec.
+        """
+        bars = {}
+        if not self.position_tracker:
+            return bars
+        open_positions = self.position_tracker.get_open_positions()
+        symbols_needed = list(set(p.symbol for p in open_positions))
+        # Najnizszy timeframe (najwyzsza rozdzielczosc) — wieksza szansa zlapania wybicia
+        tf = self.config.timeframes[0] if self.config.timeframes else "5m"
+        for symbol in symbols_needed:
+            try:
+                df = self.fetcher.fetch_ohlcv(symbol, tf)
+                if not df.empty:
+                    bars[symbol] = {
+                        "high": float(df['high'].iloc[-1]),
+                        "low": float(df['low'].iloc[-1]),
+                        "close": float(df['close'].iloc[-1]),
+                    }
+            except Exception:
+                pass
+        return bars
 
         return prices
 
@@ -1066,10 +1117,33 @@ class StochSignalBot:
 
     def _is_on_cooldown(self, key: str) -> bool:
         """Sprawdz czy sygnal jest na cooldown (anti-spam)."""
-        if key not in self._cooldowns:
+        entry = self._cooldowns.get(key)
+        if entry is None:
             return False
-        elapsed = time.time() - self._cooldowns[key]
+        # Backward-compat: stary format zapisywał sam timestamp jako float
+        ts = entry["ts"] if isinstance(entry, dict) else entry
+        elapsed = time.time() - ts
         return elapsed < self.config.cooldown_per_signal
+
+    def _cooldown_strength(self, key: str) -> int:
+        """Zwroc strength (0-3) ostatniego sygnalu pod tym kluczem; 0 = brak."""
+        entry = self._cooldowns.get(key)
+        if not isinstance(entry, dict):
+            return 0
+        return entry.get("strength", 0)
+
+    @staticmethod
+    def _signal_strength(sig) -> int:
+        """Mapowanie source -> ranga sily. Wieksza = silniejszy sygnal.
+        STOCH-ONLY = 1, STOCH+NWO = 2, STOCH STRICT+NWO = 3, CONFLUENCE = 3."""
+        src = (sig.extra_data.get("source") or "").upper()
+        if src == "CONFLUENCE":
+            return 3
+        if "STRICT" in src:
+            return 3
+        if "STOCH+NWO" in src:
+            return 2
+        return 1  # STOCH-ONLY i nieznane
 
     def _calculate_wait(self) -> float:
         """Oblicz ile sekund czekac do nastepnego skanu."""
@@ -1272,6 +1346,14 @@ Przyklady:
     parser.add_argument('--no-positions', action='store_true')
     parser.add_argument('--auto-trade', action='store_true')
 
+    # --- Anti-repaint / execution realism ---
+    parser.add_argument('--live-bar', action='store_true',
+                        help='Licz sygnaly na biezacym (niezakmnietym) barze — szybciej, ale REPAINT')
+    parser.add_argument('--apply-slippage', action='store_true',
+                        help='Symuluj slippage przy open/close (do realistycznego PnL)')
+    parser.add_argument('--slippage-pct', type=float, default=None,
+                        help='Slippage w ulamku (np. 0.001 = 0.1%%)')
+
     # --- GLM AI Analyst options ---
     parser.add_argument('--glm-key', type=str, default='',
                         help='GLM API key (Zhipu AI ChatGLM)')
@@ -1373,6 +1455,14 @@ Przyklady:
         config.default_position_size_usd = args.position_size
     if args.auto_trade:
         config.auto_open_positions = True
+
+    # Anti-repaint / slippage flags
+    if args.live_bar:
+        config.use_closed_bar = False
+    if args.apply_slippage:
+        config.apply_slippage = True
+    if args.slippage_pct is not None:
+        config.slippage_pct = args.slippage_pct
 
     # GLM AI Analyst config overrides
     if args.glm_key:

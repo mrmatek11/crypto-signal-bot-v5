@@ -87,6 +87,9 @@ class BotConfig:
     # --- Trend Filter -------------------------------------------------------
     trend_filter_mode: str = "alert"               # "alert", "block", "off" — alertuj against-trend (wiecej sygnalow)
 
+    # --- Anti-Repaint -------------------------------------------------------
+    use_closed_bar: bool = True                  # True = sygnaly na ZAMKNIETYM barze (anti-repaint); False = live (moze repaintowac)
+
     # --- Scanning -----------------------------------------------------------
     scan_interval: int = 60                      # Sekundy miedzy skanami
     candles_per_fetch: int = 100                 # Ile swiec pobierac
@@ -168,6 +171,8 @@ class BotConfig:
     use_position_tracking: bool = True           # Sledzenie pozycji (INFO, nie egzekucja!)
     auto_open_positions: bool = False             # False = ALERT ONLY, True = auto-otwieraj
     position_db_path: str = ""                   # Auto-detected
+    apply_slippage: bool = False                 # False = ceny bez korekty; True = realistyczne PnL dla backtestu/auto-trade
+    slippage_pct: float = 0.001                  # 0.1% gdy apply_slippage=True
     default_position_size_usd: float = 100       # Domyslny rozmiar pozycji (USD)
     max_open_positions: int = 10                  # Max otwartych pozycji
     position_timeout_hours: float = 72           # Max czas otwartej pozycji (godziny)

@@ -29,16 +29,24 @@ class BotConfig:
     rate_limit_ms: int = 500                      # ms miedzy requestami
     cache_ttl: int = 30                           # sekundy cache'u
 
-    # --- Watchlist (Crypto) — ograniczone do top 2 + SOL jako opcja ---
+    # --- Watchlist (Crypto) ---
     symbols: List[str] = field(default_factory=lambda: [
         "BTC/USDT",
         "ETH/USDT",
+        "SOL/USDT",
+        "BNB/USDT",
+        "XRP/USDT",
+        "DOGE/USDT",
+        "ADA/USDT",
+        "AVAX/USDT",
+        "DOT/USDT",
+        "LINK/USDT",
     ])
 
     timeframes: List[str] = field(default_factory=lambda: [
+        "5m",
         "15m",
         "1h",
-        "4h",
     ])
 
     # --- Multi-Asset Symbols ------------------------------------------------
@@ -77,12 +85,12 @@ class BotConfig:
     volume_mult: float = 1.5
 
     # --- Trend Filter -------------------------------------------------------
-    trend_filter_mode: str = "block"              # "alert", "block", "off" — blokuj against-trend (lepszy WR)
+    trend_filter_mode: str = "alert"               # "alert", "block", "off" — alertuj against-trend (wiecej sygnalow)
 
     # --- Scanning -----------------------------------------------------------
     scan_interval: int = 60                      # Sekundy miedzy skanami
     candles_per_fetch: int = 100                 # Ile swiec pobierac
-    cooldown_per_signal: int = 900               # Sekundy cooldown dla tego samego sygnalu (15 min)
+    cooldown_per_signal: int = 300                # Sekundy cooldown dla tego samego sygnalu (5 min)
 
     # --- AI News Sentiment --------------------------------------------------
     use_sentiment: bool = False                  # Wlacz AI news sentiment filter
@@ -125,7 +133,7 @@ class BotConfig:
     scanner_sessions: bool = True                # Session Reporter (Azja/Europa/US)
     scanner_correlation: bool = True             # Correlation Alert
     scanner_pulse_interval: int = 3600           # Co ile sekund Market Pulse (default: 1h)
-    scanner_volatility_threshold: float = 3.0    # current/avg vol > tego = alert (podniesione = mniej spamu)
+    scanner_volatility_threshold: float = 2.0    # current/avg vol > tego = alert
     scanner_sr_lookback: int = 50                # Ile swiec do detekcji S/R
     scanner_sr_proximity_pct: float = 1.0        # % odleglosci do S/R alert
     scanner_corr_threshold: float = 0.3          # Min rozstep korelacji do alertu

@@ -26,17 +26,29 @@ Hierarchia sygnałów (od najsilniejszego):
   🟡 STOCH-ONLY   → Stoch zone signal (K wchodzi/wychodzi z OB/OS, brak NWO/CVD)
 """
 
+import math
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 from typing import List, Optional, Dict
 
-from strategy.signal_detector import Signal
+from strategy.signal_detector import Signal, price_precision, round_price
 from strategy.neural_weight_oscillator import NeuralWeightOscillator, NWOConfig, calc_atr, ema
 
 # Global sentiment engine (lazy init)
 _sentiment_engine = None
 _use_sentiment = False  # Domyślnie OFF — włącza config.use_sentiment
+
+# Closed-bar mode: kalkuluj sygnały na ZAMKNIĘTYM barze (i = -2), nie na bieżącym (i = -1).
+# Eliminuje repaint — sygnał raz się pojawi nie zmieni już wartości HLOC.
+# Może być wyłączony jeśli ktoś świadomie chce live signals (np. scalping).
+_use_closed_bar = True
+
+
+def set_closed_bar_mode(enabled: bool):
+    """Włącz/wyłącz tryb zamkniętego baru (default: ON — anti-repaint)."""
+    global _use_closed_bar
+    _use_closed_bar = enabled
 
 
 def get_sentiment_engine():
@@ -120,6 +132,8 @@ def strategy_nwo_stoch_cvd(df: pd.DataFrame, symbol: str, timeframe: str) -> Lis
       - Trad (index/forex/commodity): CVD ±0.3 (relaxed), ±0.5 (confluence)
       - Jeśli volume=0 na wielu barach (zamknięty rynek), pomijaj CVD
     
+    v5 anti-repaint: domyślnie liczone na ZAMKNIĘTYM barze (i = len(df) - 2).
+    
     Hierarchia sygnałów (od najsilniejszego):
       ⚡ CONFLUENCE   → Stoch(relaxed) + NWO + CVD all align
       📊 STOCH+NWO    → Stoch(relaxed) + NWO histogram align  
@@ -135,7 +149,11 @@ def strategy_nwo_stoch_cvd(df: pd.DataFrame, symbol: str, timeframe: str) -> Lis
     nwo = get_nwo_instance(symbol, timeframe)
     result = nwo.compute(df)
     
-    i = len(df) - 1
+    # FIX: anti-repaint — używamy zamkniętego baru (i = -2), nie bieżącego.
+    if _use_closed_bar and len(df) >= 2:
+        i = len(df) - 2
+    else:
+        i = len(df) - 1
     
     # Sprawdź czy mamy poprawne dane
     osc_val = result["osc"].iloc[i]
@@ -183,11 +201,18 @@ def strategy_nwo_stoch_cvd(df: pd.DataFrame, symbol: str, timeframe: str) -> Lis
     elif pd.isna(cvd_val):
         return signals
     
-    # ─── Trend Filter: EMA20 vs EMA100 ────────────────────────────────
+    # ─── Trend Filter: EMA20 vs EMA100 (short/mid-term) + EMA200 (long-term) ─
     ema20 = ema(df['close'], 20)
     ema100 = ema(df['close'], 100)
     uptrend = ema20.iloc[i] > ema100.iloc[i] if not pd.isna(ema20.iloc[i]) and not pd.isna(ema100.iloc[i]) else None
     downtrend = ema20.iloc[i] < ema100.iloc[i] if uptrend is not None else None
+
+    # EMA200 = długoterminowy bias (kontekst). Wymaga >= 200 barów.
+    long_term_bias = "?"
+    if len(df) >= 200:
+        ema200 = ema(df['close'], 200)
+        if not pd.isna(ema200.iloc[i]):
+            long_term_bias = "UP" if current_price > ema200.iloc[i] else "DOWN"
     
     # ─── NWO Direction Filter (histogram-based) ─────────────────────
     nwo_bullish = histogram_val > 0
@@ -291,15 +316,16 @@ def strategy_nwo_stoch_cvd(df: pd.DataFrame, symbol: str, timeframe: str) -> Lis
             k_value=round(stoch_k, 2), d_value=round(stoch_d, 2),
             timestamp=df.index[i] if isinstance(df.index[i], datetime) else pd.Timestamp(df.index[i]).to_pydatetime(),
             extra_data={
-                "atr": round(current_atr, 2),
+                "atr": round_price(current_atr, current_price),
                 "osc": round(osc_val, 2),
                 "cvd": round(cvd_val, 2),
                 "histogram": round(histogram_val, 4),
                 "source": source,
                 "confidence": confidence,
                 "trend": "UP" if uptrend else ("DOWN" if downtrend else "?"),
-                "sl": round(sl_long, 2),
-                "tp": round(tp_long, 2),
+                "long_term_bias": long_term_bias,
+                "sl": round_price(sl_long, current_price),
+                "tp": round_price(tp_long, current_price),
                 "sl_atr_mult": SL_ATR_MULT,
                 "tp_atr_mult": TP_ATR_MULT,
                 "against_trend": long_against_trend,
@@ -376,15 +402,16 @@ def strategy_nwo_stoch_cvd(df: pd.DataFrame, symbol: str, timeframe: str) -> Lis
             k_value=round(stoch_k, 2), d_value=round(stoch_d, 2),
             timestamp=df.index[i] if isinstance(df.index[i], datetime) else pd.Timestamp(df.index[i]).to_pydatetime(),
             extra_data={
-                "atr": round(current_atr, 2),
+                "atr": round_price(current_atr, current_price),
                 "osc": round(osc_val, 2),
                 "cvd": round(cvd_val, 2),
                 "histogram": round(histogram_val, 4),
                 "source": source,
                 "confidence": confidence,
                 "trend": "UP" if uptrend else ("DOWN" if downtrend else "?"),
-                "sl": round(sl_short, 2),
-                "tp": round(tp_short, 2),
+                "long_term_bias": long_term_bias,
+                "sl": round_price(sl_short, current_price),
+                "tp": round_price(tp_short, current_price),
                 "sl_atr_mult": SL_ATR_MULT,
                 "tp_atr_mult": TP_ATR_MULT,
                 "against_trend": short_against_trend,
@@ -423,7 +450,11 @@ def get_current_nwo_state(df: pd.DataFrame, symbol: str = "", timeframe: str = "
     """Get current NWO + Stoch + CVD state for status display."""
     nwo = get_nwo_instance(symbol, timeframe)
     result = nwo.compute(df)
-    i = len(df) - 1
+    # Closed-bar dla spójności z generowaniem sygnałów
+    if _use_closed_bar and len(df) >= 2:
+        i = len(df) - 2
+    else:
+        i = len(df) - 1
     
     osc_val = result["osc"].iloc[i]
     if pd.isna(osc_val):
@@ -433,15 +464,19 @@ def get_current_nwo_state(df: pd.DataFrame, symbol: str = "", timeframe: str = "
     stoch_d = result["stoch_d"].iloc[i]
     cvd_val = result["cvd"].iloc[i]
     histogram_val = result["histogram"].iloc[i]
+    cur_price = df['close'].iloc[i]
     
     # Oblicz ATR
     atr_series = calc_atr(df['high'], df['low'], df['close'], 14)
     current_atr = atr_series.iloc[i] if not pd.isna(atr_series.iloc[i]) else None
     
-    # Trend
+    # Trend (z guard na NaN dla forex/index gdzie EMA100 może być NaN przy małej liczbie barów)
     ema20 = ema(df['close'], 20)
     ema100 = ema(df['close'], 100)
-    trend = "UP" if ema20.iloc[i] > ema100.iloc[i] else "DOWN"
+    if pd.isna(ema20.iloc[i]) or pd.isna(ema100.iloc[i]):
+        trend = "?"
+    else:
+        trend = "UP" if ema20.iloc[i] > ema100.iloc[i] else "DOWN"
     
     # NWO direction
     nwo_dir = "BULLISH" if (not pd.isna(histogram_val) and histogram_val > 0) else ("BEARISH" if not pd.isna(histogram_val) else "?")
@@ -459,14 +494,14 @@ def get_current_nwo_state(df: pd.DataFrame, symbol: str = "", timeframe: str = "
         zone = "overbought_extreme"
     
     return {
-        "price": df['close'].iloc[i],
+        "price": cur_price,
         "osc": round(osc_val, 2),
         "signal_line": round(result["signal_line"].iloc[i], 2) if not pd.isna(result["signal_line"].iloc[i]) else None,
         "histogram": round(histogram_val, 4) if not pd.isna(histogram_val) else None,
         "stoch_k": round(stoch_k, 2) if not pd.isna(stoch_k) else None,
         "stoch_d": round(stoch_d, 2) if not pd.isna(stoch_d) else None,
         "cvd": round(cvd_val, 2) if not pd.isna(cvd_val) else None,
-        "atr": round(current_atr, 2) if current_atr is not None else None,
+        "atr": round_price(current_atr, cur_price) if current_atr is not None else None,
         "zone": zone,
         "trend": trend,
         "nwo_direction": nwo_dir,

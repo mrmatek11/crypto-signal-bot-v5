@@ -4,11 +4,58 @@ Wykrywa sygnały tradingowe na podstawie wskaźników technicznych.
 Główny focus: Stochastic (7,3,2) - oversold/overbought z crossover/crossunder.
 """
 
+import math
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRICE PRECISION HELPERS — kluczowe dla niskocenowych monet (DOGE, SHIB, PEPE)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def price_precision(price: float) -> int:
+    """
+    Zwraca liczbę miejsc po przecinku adekwatną dla danego poziomu ceny.
+
+    Przykłady:
+        100000  → 2  (BTC: $67,432.50)
+        100     → 3  (BNB: $612.345)
+        1.0     → 4  (XRP: $0.6234)
+        0.1     → 5  (DOGE: $0.08234)
+        0.001   → 7  (SHIB: $0.0000234)
+
+    Używaj zamiast hardcoded round(x, 2) — to zaokrąglało SL/TP DOGE/SHIB do bezużytecznych wartości.
+    """
+    if price is None or not isinstance(price, (int, float)) or price <= 0 or math.isnan(price):
+        return 2
+    if price >= 1000:
+        return 2
+    if price >= 1:
+        return 4
+    if price >= 0.01:
+        return 5
+    if price >= 0.0001:
+        return 7
+    # mikro-ceny (np. SHIB, PEPE) — 8 miejsc
+    return 8
+
+
+def round_price(price: float, ref_price: Optional[float] = None) -> float:
+    """
+    Zaokrągla cenę używając precyzji dobranej do `ref_price` (lub samej ceny).
+
+    Args:
+        price: cena do zaokrąglenia (np. SL, TP)
+        ref_price: cena referencyjna do oszacowania precyzji (np. current price)
+                   jeśli None, używa price.
+    """
+    if price is None or (isinstance(price, float) and math.isnan(price)):
+        return 0.0
+    p = ref_price if ref_price is not None and ref_price > 0 else price
+    return round(price, price_precision(p))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -131,6 +178,7 @@ class SignalDetector:
         volume_filter: bool = False,          # Filtr wolumenu
         volume_mult: float = 1.5,
         min_bars: int = 20,                   # Min bars do obliczeń
+        use_closed_bar: bool = True,          # ANTI-REPAINT: bierz zamknięty bar (i=-2)
     ):
         self.stoch_k_length = stoch_k_length
         self.stoch_k_smooth = stoch_k_smooth
@@ -144,11 +192,12 @@ class SignalDetector:
         self.volume_filter = volume_filter
         self.volume_mult = volume_mult
         self.min_bars = min_bars
+        self.use_closed_bar = use_closed_bar
 
     def detect(self, df: pd.DataFrame, symbol: str, timeframe: str) -> List[Signal]:
         """
         Analizuje OHLCV DataFrame i zwraca listę sygnałów.
-        Sprawdza OSTATNI bar — czy pojawił się nowy sygnał.
+        Sprawdza ZAMKNIĘTY bar (i = -2) jeśli use_closed_bar=True (default), żeby uniknąć repaintu.
         """
         signals = []
 
@@ -169,7 +218,11 @@ class SignalDetector:
         atr = calc_atr(high, low, close, 14)
         vol_sma = calc_volume_sma(volume, 20) if self.volume_filter and len(volume) > 0 else None
 
-        i = len(df) - 1  # Ostatni bar
+        # FIX: anti-repaint — używamy zamkniętego baru zamiast bieżącego
+        if self.use_closed_bar and len(df) >= 2:
+            i = len(df) - 2
+        else:
+            i = len(df) - 1
 
         # Sprawdź NaN
         if pd.isna(k_line.iloc[i]) or pd.isna(d_line.iloc[i]):
@@ -240,7 +293,7 @@ class SignalDetector:
                 d_value=round(d_now, 2),
                 timestamp=df.index[i] if isinstance(df.index[i], datetime) else pd.Timestamp(df.index[i]).to_pydatetime(),
                 extra_data={
-                    "atr": round(current_atr, 2),
+                    "atr": round_price(current_atr, current_price),
                     "rsi": round(rsi_val, 2) if rsi_val else None,
                     "k_prev": round(k_prev, 2),
                     "d_prev": round(d_prev, 2),
@@ -291,7 +344,7 @@ class SignalDetector:
                 d_value=round(d_now, 2),
                 timestamp=df.index[i] if isinstance(df.index[i], datetime) else pd.Timestamp(df.index[i]).to_pydatetime(),
                 extra_data={
-                    "atr": round(current_atr, 2),
+                    "atr": round_price(current_atr, current_price),
                     "rsi": round(rsi_val, 2) if rsi_val else None,
                     "k_prev": round(k_prev, 2),
                     "d_prev": round(d_prev, 2),
@@ -313,16 +366,21 @@ class SignalDetector:
         rsi = calc_rsi(close, 14)
         atr = calc_atr(high, low, close, 14)
 
-        i = len(df) - 1
+        # Same closed-bar logic for status output
+        if self.use_closed_bar and len(df) >= 2:
+            i = len(df) - 2
+        else:
+            i = len(df) - 1
         if pd.isna(k_line.iloc[i]):
             return None
 
+        cur_price = close.iloc[i]
         return {
-            "price": close.iloc[i],
+            "price": cur_price,
             "stoch_k": round(k_line.iloc[i], 2),
             "stoch_d": round(d_line.iloc[i], 2),
             "rsi": round(rsi.iloc[i], 2) if not pd.isna(rsi.iloc[i]) else None,
-            "atr": round(atr.iloc[i], 2) if not pd.isna(atr.iloc[i]) else None,
+            "atr": round_price(atr.iloc[i], cur_price) if not pd.isna(atr.iloc[i]) else None,
             "zone": "oversold" if k_line.iloc[i] < self.oversold_threshold else
                     "overbought" if k_line.iloc[i] > self.overbought_threshold else "neutral",
         }

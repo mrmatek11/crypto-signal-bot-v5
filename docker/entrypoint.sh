@@ -1,7 +1,7 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
 #  Entrypoint for Docker — przekazuje env vars jako CLI args
-#  v2: Sekrety (webhook, API keys) czytane z env vars przez config.py
+#  v3: + USE_CLOSED_BAR, APPLY_SLIPPAGE, SLIPPAGE_PCT, AUTO_TRADE
 # ═══════════════════════════════════════════════════════════
 
 set -e
@@ -12,6 +12,7 @@ echo "   Symbols: ${SYMBOLS:-BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,DOGE/U
 echo "   Timeframes: ${TIMEFRAMES:-5m,15m,1h}"
 echo "   Trend filter: ${TREND_FILTER:-alert}"
 echo "   Market: ${MARKET:-both}"
+echo "   Closed-bar: ${USE_CLOSED_BAR:-true}"
 echo "   AI Sentiment: ${SENTIMENT:-false}"
 echo "   GLM AI Analyst: ${GLM_API_KEY:+✅}${GLM_API_KEY:-❌}"
 echo "═════════════════════════════════════════════════════════"
@@ -19,7 +20,7 @@ echo "════════════════════════�
 # Build command using bash array (proper quoting)
 ARGS=()
 
-# Webhook is now read from env var by config.py — only pass --test if not set
+# Webhook is read from env var by config.py — only pass --test if not set
 if [ -z "$DISCORD_WEBHOOK" ]; then
     ARGS+=("--test")
     echo "⚠️ No DISCORD_WEBHOOK set — running in TEST mode"
@@ -45,7 +46,7 @@ if [ -n "$TREND_FILTER" ]; then
     ARGS+=("--trend-filter" "$TREND_FILTER")
 fi
 
-# Market source — always pass if set (including "crypto")
+# Market source
 if [ -n "$MARKET" ]; then
     ARGS+=("--market" "$MARKET")
 fi
@@ -55,13 +56,10 @@ if [ "$SENTIMENT" = "true" ]; then
     ARGS+=("--sentiment")
 fi
 
-# API keys are now read from env vars by config.py
-# (CRYPTOPANIC_KEY, FINNHUB_KEY — no longer passed via CLI to avoid ps aux leak)
-# Only pass if explicitly needed as CLI override:
+# News API keys (jeśli explicit override potrzebne — normalnie czyta z env)
 if [ -n "$CRYPTOPANIC_KEY" ]; then
     ARGS+=("--cryptopanic-key" "$CRYPTOPANIC_KEY")
 fi
-
 if [ -n "$FINNHUB_KEY" ]; then
     ARGS+=("--finnhub-key" "$FINNHUB_KEY")
 fi
@@ -80,10 +78,26 @@ if [ "$GLM_DISABLED" = "true" ]; then
     ARGS+=("--no-glm")
 fi
 
-# Position size
+# Position tracking & auto-trade
 if [ -n "$POSITION_SIZE" ]; then
     ARGS+=("--position-size" "$POSITION_SIZE")
 fi
+if [ "$AUTO_TRADE" = "true" ]; then
+    ARGS+=("--auto-trade")
+fi
+
+# ── v5 anti-repaint / slippage flags ────────────────────────
+# USE_CLOSED_BAR=false → bot.py używa --live-bar
+if [ "$USE_CLOSED_BAR" = "false" ]; then
+    ARGS+=("--live-bar")
+fi
+if [ "$APPLY_SLIPPAGE" = "true" ]; then
+    ARGS+=("--apply-slippage")
+fi
+if [ -n "$SLIPPAGE_PCT" ]; then
+    ARGS+=("--slippage-pct" "$SLIPPAGE_PCT")
+fi
+# ────────────────────────────────────────────────────────────
 
 # Market Scanner
 if [ "$SCANNER_DISABLED" = "true" ]; then
@@ -108,7 +122,7 @@ if [ "$SCANNER_CORR_DISABLED" = "true" ]; then
     ARGS+=("--no-scanner-corr")
 fi
 
-# New KOMBAJN features
+# KOMBAJN features
 if [ "$USE_NEWS_MONITOR" = "false" ]; then
     ARGS+=("--no-news")
 fi
@@ -138,5 +152,4 @@ if [ -n "$LOG_LEVEL" ]; then
     ARGS+=("--log" "$LOG_LEVEL")
 fi
 
-# Execute with proper array expansion (handles spaces in values)
 exec python3 bot.py "${ARGS[@]}"

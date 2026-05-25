@@ -150,17 +150,19 @@ ASSET_TF_OVERRIDES = {
     "FOREX": ["15m", "1h", "4h", "1d"],      # Forex: min 15m
     "COMMODITY": ["15m", "1h", "4h", "1d"],   # Towary: min 15m
     # CRYPTO: all TFs allowed (not in dict = no restriction)
+    # 5m is only valid for crypto via Binance/ccxt
 }
 
 
 def get_asset_class(symbol: str) -> str:
-    """Zwróć klasę assetu (crypto, index, forex, commodity, stock).
+    """Zwróć klasę assetu (CRYPTO, INDEX, FOREX, COMMODITY, STOCK).
     
-    Alias dla YFinanceDataFetcher.get_market_type() ale lowercase.
+    Alias dla YFinanceDataFetcher.get_market_type().
     Używane przez bot.py do filtrowania timeframe'ów.
+    Zwraca UPPERCASE — spójne z kluczami ASSET_TF_OVERRIDES.
     """
     market_type = YFinanceDataFetcher.get_market_type(symbol)
-    return market_type.lower()
+    return market_type.upper()
 
 # Formatowanie ceny per typ rynku
 PRICE_FORMAT = {

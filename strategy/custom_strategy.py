@@ -70,7 +70,7 @@ TP_ATR_MULT = 4.5
 #   "alert" = alertuj z ostrzeżeniem ⚠️ (default)
 #   "block" = całkowita blokada — nie alertuj w ogóle
 #   "off"   = brak filtra trendu
-TREND_FILTER_MODE = "block"
+TREND_FILTER_MODE = "alert"
 
 
 def get_nwo_instance(symbol: str, timeframe: str, config: NWOConfig = None) -> NeuralWeightOscillator:

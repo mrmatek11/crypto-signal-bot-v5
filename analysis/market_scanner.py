@@ -254,7 +254,7 @@ class MarketScanner:
                 })
 
             except Exception as e:
-                logger.debug(f"Pulse scan error {symbol}: {e}")
+                logger.debug(f"Pulse scan error {symbol}: {e}")  # OK — individual symbol error
                 continue
 
         if not movers:
@@ -396,7 +396,7 @@ class MarketScanner:
                     self._alert_count += 1
 
             except Exception as e:
-                logger.debug(f"Vol scan error {symbol}: {e}")
+                logger.debug(f"Vol scan error {symbol}: {e}")  # OK — individual symbol error
                 continue
 
         if alerts:
@@ -605,7 +605,7 @@ class MarketScanner:
                         self._alert_count += 1
 
             except Exception as e:
-                logger.debug(f"S/R scan error {symbol}: {e}")
+                logger.debug(f"S/R scan error {symbol}: {e}")  # OK — individual symbol error
                 continue
 
         if alerts:
@@ -672,11 +672,11 @@ class MarketScanner:
             open_time = session_data["open_cet"]
             close_time = session_data["close_cet"]
 
-            # Sprawdz otwarcie (w oknie +/-5 min)
+            # Sprawdz otwarcie (w oknie +/-10 min)
             session_report_key_open = f"{today_key}_{session_key}_opened"
             session_report_key_close = f"{today_key}_{session_key}_closed"
 
-            if self._is_within_minutes(current_hm, open_time, 5) and session_report_key_open not in self._reported_sessions:
+            if self._is_within_minutes(current_hm, open_time, 10) and session_report_key_open not in self._reported_sessions:
                 info = SessionInfo(
                     name=session_data["name"],
                     status="opening",
@@ -688,7 +688,7 @@ class MarketScanner:
                 return ("opening", session_key, info)
 
             # Sprawdz zamkniecie
-            if self._is_within_minutes(current_hm, close_time, 5) and session_report_key_close not in self._reported_sessions:
+            if self._is_within_minutes(current_hm, close_time, 10) and session_report_key_close not in self._reported_sessions:
                 info = SessionInfo(
                     name=session_data["name"],
                     status="closing",
@@ -817,7 +817,7 @@ class MarketScanner:
                     self._alert_count += 1
 
             except Exception as e:
-                logger.debug(f"Correlation scan error {sym_a}/{sym_b}: {e}")
+                logger.debug(f"Correlation scan error {sym_a}/{sym_b}: {e}")  # OK — individual pair error
                 continue
 
         if divergences:

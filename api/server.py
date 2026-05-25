@@ -96,13 +96,18 @@ def create_api_app(bot_instance=None) -> Any:
 
         now = datetime.now(timezone.utc)
         cooldown_data = {}
-        for key, ts in _bot._cooldowns.items():
+        for key, entry in _bot._cooldowns.items():
             from datetime import timedelta
+            ts = entry["ts"] if isinstance(entry, dict) else entry
+            strength = entry.get("strength") if isinstance(entry, dict) else None
+            source = entry.get("source") if isinstance(entry, dict) else None
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
             cooldown_data[key] = {
                 "last_signal": dt.isoformat(),
                 "cooldown_until": (dt + timedelta(seconds=_bot.config.cooldown_per_signal)).isoformat(),
                 "is_on_cooldown": (datetime.now(timezone.utc).timestamp() - ts) < _bot.config.cooldown_per_signal,
+                "strength": strength,
+                "source": source,
             }
 
         return {

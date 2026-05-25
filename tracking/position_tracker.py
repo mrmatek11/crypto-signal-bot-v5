@@ -92,7 +92,7 @@ class PositionTracker:
     DEFAULT_TIMEOUT_HOURS = 72       # Max czas otwartej pozycji (3 dni)
     DEFAULT_POSITION_SIZE_USD = 100   # Domyślny rozmiar w USD
     MAX_OPEN_POSITIONS = 10          # Limit jednocześnie otwartych
-    SLIPPAGE_PCT = 0.001             # 0.1% slippage assumption
+    DEFAULT_SLIPPAGE_PCT = 0.001     # 0.1% — używane gdy apply_slippage=True
 
     def __init__(
         self,
@@ -100,13 +100,19 @@ class PositionTracker:
         timeout_hours: float = 72,
         default_size_usd: float = 100,
         max_open: int = 10,
+        apply_slippage: bool = False,                # Domyślnie OFF — opisuje EXECUTION, nie alerty
+        slippage_pct: float = DEFAULT_SLIPPAGE_PCT,  # 0.1% jeśli włączone
     ):
         self.db_path = db_path
         self.timeout_hours = timeout_hours
         self.default_size_usd = default_size_usd
         self.max_open = max_open
+        self.apply_slippage = apply_slippage
+        self.slippage_pct = slippage_pct
         self._conn = None
-        self._mutex = threading.Lock()  # FIX #8: Mutex dla concurrent access (SQLite race condition)
+        # FIX: RLock (reentrant) zamiast Lock — open_position woła get_open_count()
+        # ktore tez bierze mutex; z plain Lock to byl deadlock.
+        self._mutex = threading.RLock()
         self._init_db()
 
     def _init_db(self):
@@ -217,12 +223,15 @@ class PositionTracker:
         if size <= 0:
             size = self.default_size_usd / entry_price if entry_price > 0 else 0
 
-        # Apply slippage
-        slip = entry_price * self.SLIPPAGE_PCT
-        if direction == "LONG":
-            actual_entry = entry_price + slip  # Kupujesz drożej
+        # Apply slippage (jeśli włączony — domyślnie OFF dla trybu alertowego)
+        if self.apply_slippage:
+            slip = entry_price * self.slippage_pct
+            if direction == "LONG":
+                actual_entry = entry_price + slip  # Kupujesz drożej
+            else:
+                actual_entry = entry_price - slip  # Sprzedajesz taniej
         else:
-            actual_entry = entry_price - slip  # Sprzedajesz taniej
+            actual_entry = entry_price
 
         now = datetime.now(timezone.utc).isoformat()
 
@@ -293,12 +302,15 @@ class PositionTracker:
             print(f"[PositionTracker] Position {position_id} already closed")
             return None
 
-        # Apply slippage on close
-        slip = close_price * self.SLIPPAGE_PCT
-        if pos.direction == "LONG":
-            actual_close = close_price - slip  # Sprzedajesz taniej
+        # Apply slippage on close (jeśli włączony — odzwierciedla realny fill)
+        if self.apply_slippage:
+            slip = close_price * self.slippage_pct
+            if pos.direction == "LONG":
+                actual_close = close_price - slip  # Sprzedajesz taniej
+            else:
+                actual_close = close_price + slip  # Kupujesz drożej
         else:
-            actual_close = close_price + slip  # Kupujesz drożej
+            actual_close = close_price
 
         # Oblicz PnL
         if pos.direction == "LONG":
@@ -354,12 +366,16 @@ class PositionTracker:
     def _check_closes_impl(
         self,
         current_prices: Dict[str, float],
+        current_bars: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> List[Position]:
         """
         Sprawdź otwarte pozycje i zamknij jeśli SL/TP hit lub timeout.
 
         Args:
-            current_prices: dict symbol → aktualna cena
+            current_prices: dict symbol → aktualna cena (close)
+            current_bars: opcjonalny dict symbol → {"high": ..., "low": ..., "close": ...}
+                          Jeśli podany, używamy intra-bar high/low do detekcji SL/TP —
+                          to wyłapuje knoty świec, których sam close by przegapił.
 
         Returns:
             Lista zamkniętych pozycji
@@ -372,29 +388,39 @@ class PositionTracker:
             if price is None:
                 continue
 
+            # Intra-bar dane — jeśli dostępne, używamy ich do detekcji wybicia SL/TP
+            bar = (current_bars or {}).get(pos.symbol)
+            bar_high = bar["high"] if bar and "high" in bar else price
+            bar_low = bar["low"] if bar and "low" in bar else price
+
             should_close = False
             reason = ""
+            exec_price = price  # cena, po której symulujemy egzekucję
 
-            # ─── SL/TP Check ──────────────────────────────────────
+            # ─── SL/TP Check (intra-bar) ──────────────────────────
             if pos.direction == "LONG":
-                # SL hit: cena spadła poniżej SL
-                if pos.sl > 0 and price <= pos.sl:
+                # SL hit: low baru spadł <= SL
+                if pos.sl > 0 and bar_low <= pos.sl:
                     should_close = True
                     reason = "SL"
-                # TP hit: cena wzrosła powyżej TP
-                elif pos.tp > 0 and price >= pos.tp:
+                    exec_price = pos.sl  # assume fill at SL (pesymistycznie)
+                # TP hit: high baru wzrosł >= TP
+                elif pos.tp > 0 and bar_high >= pos.tp:
                     should_close = True
                     reason = "TP"
+                    exec_price = pos.tp
 
             elif pos.direction == "SHORT":
-                # SL hit: cena wzrosła powyżej SL
-                if pos.sl > 0 and price >= pos.sl:
+                # SL hit: high baru wzrósł >= SL
+                if pos.sl > 0 and bar_high >= pos.sl:
                     should_close = True
                     reason = "SL"
-                # TP hit: cena spadła poniżej TP
-                elif pos.tp > 0 and price <= pos.tp:
+                    exec_price = pos.sl
+                # TP hit: low baru spadł <= TP
+                elif pos.tp > 0 and bar_low <= pos.tp:
                     should_close = True
                     reason = "TP"
+                    exec_price = pos.tp
 
             # ─── Timeout Check ─────────────────────────────────────
             if not should_close and self.timeout_hours > 0:
@@ -402,9 +428,10 @@ class PositionTracker:
                 if hours and hours > self.timeout_hours:
                     should_close = True
                     reason = "timeout"
+                    exec_price = price
 
             if should_close:
-                result = self.close_position(pos.id, price, reason)
+                result = self.close_position(pos.id, exec_price, reason)
                 if result:
                     closed.append(result)
 
